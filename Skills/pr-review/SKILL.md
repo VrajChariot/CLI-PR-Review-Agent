@@ -20,6 +20,7 @@ Provide a high-signal code review for a given pull request. Prefer silence over 
   - `pr_diff` — unified diff of the PR (optional `path` argument for one file).
   - `pr_comments` — every existing comment (author, body, file, line).
   - `pr_file_link` — exact permalink for a file line range at the PR head commit.
+  - `pr_instruction_files` — every instruction file (`AGENTS.md`, `CLAUDE.md`, etc.) that applies to a changed path, with full text.
   - `pr_post_summary_comment`, `pr_post_inline_comment` — only present when `--comment` was given (the summary tool may be withheld when summaries are disabled).
 - Read access to the repository checkout. The working directory is a checkout of the PR head commit.
 - Sub-agent support is optional. If the agent runtime can run parallel sub-agents, use them where noted. Otherwise run the same passes sequentially yourself. Wherever a model tier is mentioned, use the cheapest model for mechanical checks and the strongest available model for bug and logic analysis. Sub-agents cannot call `pr_*` tools: give each one the diff hunks, paths, and PR metadata it needs in its task.
@@ -45,7 +46,9 @@ Note: PRs authored by AI agents are still reviewed. A PR that already has review
 
 ### 2. Gather repository context before assessing code (cheap model)
 
-Before assessing the PR's implementation, gather the repository context that defines its intended behavior. This step is mandatory and must happen before any bug or instruction-compliance pass. Return file paths for:
+Before assessing the PR's implementation, gather the repository context that defines its intended behavior. This step is mandatory and must happen before any bug or instruction-compliance pass.
+
+Call `pr_instruction_files` first. It deterministically returns every instruction file that applies to a changed path (with its full text and the directory it applies to); treat that list as authoritative and complete. Then, beyond it, return file paths for:
 
 - Root-level instruction files, if they exist: `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `CONTRIBUTING.md`, `.cursor/rules/*`, `.github/copilot-instructions.md`.
 - Any such files in directories that contain files modified by the PR (and parent directories up to the root).

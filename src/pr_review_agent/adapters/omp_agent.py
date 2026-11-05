@@ -10,6 +10,7 @@ from ..domain.models import InlineComment, ReviewOutcome, ensure_marker
 from ..errors import AgentError
 from ..ports.agent import ReviewJob
 from ..skill import load_skill_text
+from .instruction_files import discover_instruction_files
 
 _NO_ARGS: dict[str, Any] = {"type": "object", "properties": {}, "additionalProperties": False}
 _DUP_SUMMARY = "Duplicate: a summary comment was already posted in this run; not posted again."
@@ -42,6 +43,9 @@ def build_host_tools(job: ReviewJob, posted: list[str]) -> list[HostTool[Any, An
         data["platform"] = job.platform.platform.value
         data["reviewer_account"] = {"id": account.id, "name": account.name}
         return _json(data)
+
+    def pr_instruction_files(args: dict, ctx: Any) -> str:
+        return _json(discover_instruction_files(job.workspace.root, changed_files()))
 
     def pr_changed_files(args: dict, ctx: Any) -> str:
         return _json([asdict(f) for f in changed_files()])
@@ -107,6 +111,14 @@ def build_host_tools(job: ReviewJob, posted: list[str]) -> list[HostTool[Any, An
             pr_get,
         ),
         tool("pr_changed_files", "Changed paths of the PR with status.", _NO_ARGS, pr_changed_files),
+        tool(
+            "pr_instruction_files",
+            "Every instruction file (AGENTS.md, CLAUDE.md, GEMINI.md, CONTRIBUTING.md, "
+            ".github/copilot-instructions.md, .cursor/rules/*) that applies to a changed path, "
+            "with its full text and the directory it applies to. Always call this in Step 2.",
+            _NO_ARGS,
+            pr_instruction_files,
+        ),
         tool(
             "pr_diff",
             "Unified diff of the PR. Optional path limits it to one file.",
