@@ -3,14 +3,14 @@ import json
 import httpx
 import pytest
 
-from pr_review_agent.adapters.github import GitHubAdapter
+from pr_review_agent.adapters.github import GitHubAdapter, GitHubRepository
 from pr_review_agent.domain.models import InlineComment, PrState
 from pr_review_agent.errors import PlatformError
 
 
 def adapter(handler) -> GitHubAdapter:
     client = httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler))
-    return GitHubAdapter("acme", "widgets", 7, "tok", client)
+    return GitHubRepository("acme", "widgets", "tok", client).pull_request(7)
 
 
 def pr_json(**over):
@@ -97,3 +97,24 @@ def test_api_error_includes_message():
     a = adapter(lambda r: httpx.Response(404, json={"message": "Not Found"}))
     with pytest.raises(PlatformError, match="404 Not Found"):
         a.get_pull_request()
+
+
+def test_list_open_pull_requests_follows_link_and_maps_numbers():
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.url)
+        if request.url.params.get("page") == "2":
+            return httpx.Response(200, json=[pr_json() | {"number": 3}])
+        return httpx.Response(
+            200,
+            json=[pr_json() | {"number": 9}],
+            headers={"Link": '<https://api.github.com/repos/acme/widgets/pulls?page=2>; rel="next"'},
+        )
+
+    client = httpx.Client(base_url="https://api.github.com", transport=httpx.MockTransport(handler))
+    prs = GitHubRepository("acme", "widgets", "tok", client).list_open_pull_requests()
+    assert [p.number for p in prs] == [3, 9]
+    assert prs[0].head_fetch_ref == "refs/pull/3/head"
+    assert seen[0].path == "/repos/acme/widgets/pulls"
+    assert seen[0].params["state"] == "open" and seen[0].params["per_page"] == "100"

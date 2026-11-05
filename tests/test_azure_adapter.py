@@ -3,7 +3,11 @@ import json
 import httpx
 import pytest
 
-from pr_review_agent.adapters.azure_devops import AzureCoords, AzureDevOpsAdapter
+from pr_review_agent.adapters.azure_devops import (
+    AzureCoords,
+    AzureDevOpsAdapter,
+    AzureRepository,
+)
 from pr_review_agent.domain.models import InlineComment, PrState
 from pr_review_agent.errors import PlatformError
 
@@ -11,7 +15,9 @@ COORDS = AzureCoords("https://dev.azure.com/org", "org", "My Project", "repo")
 
 
 def adapter(handler) -> AzureDevOpsAdapter:
-    return AzureDevOpsAdapter(COORDS, 9, "pat", httpx.Client(transport=httpx.MockTransport(handler)))
+    return AzureRepository(
+        COORDS, "pat", httpx.Client(transport=httpx.MockTransport(handler))
+    ).pull_request(9)
 
 
 def pr_json(status="active", **over):
@@ -45,12 +51,12 @@ def test_requests_carry_api_version_and_basic_auth():
         seen["url"] = request.url.raw_path.decode().split("?")[0]
         return httpx.Response(200, json=pr_json())
 
-    a = AzureDevOpsAdapter(COORDS, 9, "pat", None)
-    a._client = httpx.Client(transport=httpx.MockTransport(handler), headers=a._client.headers)
-    a.get_pull_request()
+    repo = AzureRepository(COORDS, "pat", None)
+    repo._client = httpx.Client(transport=httpx.MockTransport(handler), headers=repo._client.headers)
+    repo.pull_request(9).get_pull_request()
     assert seen["v"] == "7.1"
     assert seen["url"] == "/org/My%20Project/_apis/git/repositories/repo/pullRequests/9"
-    assert a._client.headers["Authorization"].startswith("Basic ")
+    assert repo._client.headers["Authorization"].startswith("Basic ")
 
 
 def test_comments_exclude_system_and_deleted():
@@ -104,3 +110,50 @@ def test_file_link_format():
         f"&version=GC{'h' * 40}&line=4&lineEnd=8&lineStartColumn=1&lineEndColumn=1"
         "&lineStyle=plain&_a=contents"
     )
+
+
+def repo_for(handler) -> AzureRepository:
+    return AzureRepository(COORDS, "pat", httpx.Client(transport=httpx.MockTransport(handler)))
+
+
+def test_list_open_pull_requests_pages_and_maps_ids():
+    seen = []
+
+    def handler(request):
+        p = request.url.params
+        seen.append((request.url.raw_path.decode().split("?")[0], dict(p)))
+        skip = int(p["$skip"])
+        count = 100 if skip == 0 else 2
+        return httpx.Response(
+            200,
+            json={
+                "value": [
+                    pr_json(pullRequestId=1000 - skip - i, title=f"t{skip + i}")
+                    for i in range(count)
+                ]
+            },
+        )
+
+    prs = repo_for(handler).list_open_pull_requests()
+    assert len(prs) == 102
+    assert [p.number for p in prs] == sorted(p.number for p in prs)
+    assert {p.number for p in prs} >= {1000, 899}
+    assert prs[-1].web_url == "https://dev.azure.com/org/My%20Project/_git/repo/pullrequest/1000"
+    path, params = seen[0]
+    assert path == "/org/My%20Project/_apis/git/repositories/repo/pullrequests"
+    assert params["searchCriteria.status"] == "active"
+    assert params["api-version"] == "7.1" and params["$top"] == "100"
+    assert [s[1]["$skip"] for s in seen] == ["0", "100"]
+
+
+def test_list_falls_back_to_detail_when_merge_commits_missing():
+    def handler(request):
+        if request.url.path.endswith("/pullrequests"):
+            item = pr_json(pullRequestId=4)
+            del item["lastMergeSourceCommit"]
+            return httpx.Response(200, json={"value": [item]})
+        assert request.url.path.endswith("/pullRequests/4")
+        return httpx.Response(200, json=pr_json())
+
+    (pr,) = repo_for(handler).list_open_pull_requests()
+    assert (pr.number, pr.head_sha) == (4, "h" * 40)

@@ -39,18 +39,31 @@ def parse_github_pr_url(url: str) -> tuple[str, str, int] | None:
     return (m["o"], m["r"], int(m["n"])) if m else None
 
 
-def github_from_args(
+def github_repository_from_remote(
     remote_url: str,
-    pr_arg: str,
     env: Mapping[str, str],
     client: httpx.Client | None = None,
-) -> "GitHubAdapter":
+) -> "GitHubRepository":
     remote = parse_github_remote(remote_url)
     if remote is None:
         raise ConfigError(
             f"--adapter github, but remote URL {remote_url} is not a github.com repository"
         )
     owner, repo = remote
+    token = env.get("GITHUB_TOKEN") or env.get("GH_TOKEN")
+    if not token:
+        raise ConfigError("GITHUB_TOKEN (or GH_TOKEN) is required for --adapter github")
+    return GitHubRepository(owner, repo, token, client)
+
+
+def github_from_args(
+    remote_url: str,
+    pr_arg: str,
+    env: Mapping[str, str],
+    client: httpx.Client | None = None,
+) -> "GitHubAdapter":
+    repository = github_repository_from_remote(remote_url, env, client)
+    owner, repo = repository.owner, repository.repo
     if pr_arg.isdigit():
         number = int(pr_arg)
     else:
@@ -62,26 +75,47 @@ def github_from_args(
         o, r, number = parsed
         if (o.lower(), r.lower()) != (owner.lower(), repo.lower()):
             raise ConfigError(f"PR URL is for {o}/{r} but remote points to {owner}/{repo}")
-    token = env.get("GITHUB_TOKEN") or env.get("GH_TOKEN")
-    if not token:
-        raise ConfigError("GITHUB_TOKEN (or GH_TOKEN) is required for --adapter github")
-    return GitHubAdapter(owner, repo, number, token, client)
+    return repository.pull_request(number)
 
 
-class GitHubAdapter:
+def _to_pull_request(d: dict[str, Any], number: int) -> PullRequest:
+    if d.get("merged_at"):
+        state = PrState.MERGED
+    elif d["state"] == "closed":
+        state = PrState.CLOSED
+    else:
+        state = PrState.OPEN
+    return PullRequest(
+        number=number,
+        title=d["title"],
+        description=d.get("body") or "",
+        author=d["user"]["login"],
+        state=state,
+        is_draft=bool(d.get("draft")),
+        source_branch=d["head"]["ref"],
+        target_branch=d["base"]["ref"],
+        head_sha=d["head"]["sha"],
+        base_sha=d["base"]["sha"],
+        web_url=d["html_url"],
+        head_fetch_ref=f"refs/pull/{number}/head",
+        base_fetch_ref=f"refs/heads/{d['base']['ref']}",
+    )
+
+
+class GitHubRepository:
+    """Repository-level GitHub client: lists open PRs and hands out per-PR adapters."""
+
     platform = Platform.GITHUB
 
     def __init__(
         self,
         owner: str,
         repo: str,
-        number: int,
         token: str,
         client: httpx.Client | None = None,
     ) -> None:
-        self._owner = owner
-        self._repo = repo
-        self._number = number
+        self.owner = owner
+        self.repo = repo
         self._client = client or httpx.Client(
             base_url="https://api.github.com",
             timeout=30,
@@ -92,10 +126,6 @@ class GitHubAdapter:
                 "User-Agent": "pr-review-agent",
             },
         )
-
-    @property
-    def _repo_path(self) -> str:
-        return f"/repos/{self._owner}/{self._repo}"
 
     def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
         try:
@@ -112,9 +142,9 @@ class GitHubAdapter:
             )
         return response
 
-    def _paginate(self, path: str) -> list[dict[str, Any]]:
+    def _paginate(self, path: str, **params: Any) -> list[dict[str, Any]]:
         items: list[dict[str, Any]] = []
-        response = self._request("GET", path, params={"per_page": 100})
+        response = self._request("GET", path, params={"per_page": 100, **params})
         while True:
             items.extend(response.json())
             next_url = response.links.get("next", {}).get("url")
@@ -122,29 +152,44 @@ class GitHubAdapter:
                 return items
             response = self._request("GET", next_url)
 
+    def list_open_pull_requests(self) -> list[PullRequest]:
+        items = self._paginate(f"/repos/{self.owner}/{self.repo}/pulls", state="open")
+        return sorted(
+            (_to_pull_request(d, d["number"]) for d in items), key=lambda pr: pr.number
+        )
+
+    def pull_request(self, number: int) -> "GitHubAdapter":
+        return GitHubAdapter(self, number)
+
+
+class GitHubAdapter:
+    platform = Platform.GITHUB
+
+    def __init__(self, repository: GitHubRepository, number: int) -> None:
+        self._repository = repository
+        self._number = number
+
+    @property
+    def _owner(self) -> str:
+        return self._repository.owner
+
+    @property
+    def _repo(self) -> str:
+        return self._repository.repo
+
+    @property
+    def _repo_path(self) -> str:
+        return f"/repos/{self._owner}/{self._repo}"
+
+    def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
+        return self._repository._request(method, path, **kwargs)
+
+    def _paginate(self, path: str) -> list[dict[str, Any]]:
+        return self._repository._paginate(path)
+
     def get_pull_request(self) -> PullRequest:
         d = self._request("GET", f"{self._repo_path}/pulls/{self._number}").json()
-        if d.get("merged_at"):
-            state = PrState.MERGED
-        elif d["state"] == "closed":
-            state = PrState.CLOSED
-        else:
-            state = PrState.OPEN
-        return PullRequest(
-            number=self._number,
-            title=d["title"],
-            description=d.get("body") or "",
-            author=d["user"]["login"],
-            state=state,
-            is_draft=bool(d.get("draft")),
-            source_branch=d["head"]["ref"],
-            target_branch=d["base"]["ref"],
-            head_sha=d["head"]["sha"],
-            base_sha=d["base"]["sha"],
-            web_url=d["html_url"],
-            head_fetch_ref=f"refs/pull/{self._number}/head",
-            base_fetch_ref=f"refs/heads/{d['base']['ref']}",
-        )
+        return _to_pull_request(d, self._number)
 
     def get_authenticated_account(self) -> Account:
         login = self._request("GET", "/user").json()["login"]

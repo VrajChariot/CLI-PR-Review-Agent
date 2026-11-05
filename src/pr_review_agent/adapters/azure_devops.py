@@ -90,17 +90,30 @@ def parse_azure_pr_url(url: str) -> tuple[AzureCoords, int] | None:
     return None
 
 
+def azure_repository_from_remote(
+    remote_url: str,
+    env: Mapping[str, str],
+    client: httpx.Client | None = None,
+) -> "AzureRepository":
+    coords = parse_azure_remote(remote_url)
+    if coords is None:
+        raise ConfigError(
+            f"--adapter azure, but remote URL {remote_url} is not an Azure DevOps repository"
+        )
+    pat = env.get("AZURE_DEVOPS_PAT")
+    if not pat:
+        raise ConfigError("AZURE_DEVOPS_PAT is required for --adapter azure")
+    return AzureRepository(coords, pat, client)
+
+
 def azure_from_args(
     remote_url: str,
     pr_arg: str,
     env: Mapping[str, str],
     client: httpx.Client | None = None,
 ) -> "AzureDevOpsAdapter":
-    coords = parse_azure_remote(remote_url)
-    if coords is None:
-        raise ConfigError(
-            f"--adapter azure, but remote URL {remote_url} is not an Azure DevOps repository"
-        )
+    repository = azure_repository_from_remote(remote_url, env, client)
+    coords = repository.coords
     if pr_arg.isdigit():
         number = int(pr_arg)
     else:
@@ -114,28 +127,58 @@ def azure_from_args(
             raise ConfigError(
                 f"PR URL is for {url_coords.display()} but remote points to {coords.display()}"
             )
-    pat = env.get("AZURE_DEVOPS_PAT")
-    if not pat:
-        raise ConfigError("AZURE_DEVOPS_PAT is required for --adapter azure")
-    return AzureDevOpsAdapter(coords, number, pat, client)
+    return repository.pull_request(number)
 
 
 def _strip_heads(ref: str) -> str:
     return ref.removeprefix("refs/heads/")
 
 
-class AzureDevOpsAdapter:
+def _web_url(coords: AzureCoords, number: int) -> str:
+    return (
+        f"{coords.base_url}/{quote(coords.project)}/_git/{quote(coords.repository)}"
+        f"/pullrequest/{number}"
+    )
+
+
+def _to_pull_request(d: dict[str, Any], number: int, web_url: str) -> PullRequest:
+    state = {
+        "active": PrState.OPEN,
+        "completed": PrState.MERGED,
+        "abandoned": PrState.CLOSED,
+    }[d["status"]]
+    return PullRequest(
+        number=number,
+        title=d["title"],
+        description=d.get("description") or "",
+        author=d["createdBy"]["displayName"],
+        state=state,
+        is_draft=bool(d.get("isDraft")),
+        source_branch=_strip_heads(d["sourceRefName"]),
+        target_branch=_strip_heads(d["targetRefName"]),
+        head_sha=d["lastMergeSourceCommit"]["commitId"],
+        base_sha=d["lastMergeTargetCommit"]["commitId"],
+        web_url=web_url,
+        head_fetch_ref=d["sourceRefName"],
+        base_fetch_ref=d["targetRefName"],
+    )
+
+
+_PAGE_SIZE = 100
+
+
+class AzureRepository:
+    """Repository-level Azure DevOps client: lists active PRs and hands out per-PR adapters."""
+
     platform = Platform.AZURE
 
     def __init__(
         self,
         coords: AzureCoords,
-        number: int,
         pat: str,
         client: httpx.Client | None = None,
     ) -> None:
-        self._coords = coords
-        self._number = number
+        self.coords = coords
         self._client = client or httpx.Client(
             timeout=30,
             headers={
@@ -145,28 +188,11 @@ class AzureDevOpsAdapter:
             },
         )
 
-    @property
-    def _project(self) -> str:
-        return quote(self._coords.project)
-
-    @property
-    def _prefix(self) -> str:
-        c = self._coords
-        return (
-            f"{c.base_url}/{self._project}/_apis/git/repositories/"
-            f"{quote(c.repository)}/pullRequests/{self._number}"
-        )
-
-    @property
-    def _web_url(self) -> str:
-        c = self._coords
-        return f"{c.base_url}/{self._project}/_git/{quote(c.repository)}/pullrequest/{self._number}"
-
     def _request(
         self, method: str, url: str, *, versioned: bool = True, **kwargs: Any
     ) -> httpx.Response:
         if versioned:
-            kwargs["params"] = {"api-version": API_VERSION}
+            kwargs["params"] = {**kwargs.get("params", {}), "api-version": API_VERSION}
         try:
             response = self._client.request(method, url, **kwargs)
         except httpx.HTTPError as exc:
@@ -186,28 +212,69 @@ class AzureDevOpsAdapter:
             )
         return response
 
+    def list_open_pull_requests(self) -> list[PullRequest]:
+        c = self.coords
+        url = (
+            f"{c.base_url}/{quote(c.project)}/_apis/git/repositories/"
+            f"{quote(c.repository)}/pullrequests"
+        )
+        items: list[dict[str, Any]] = []
+        while True:
+            params = {
+                "searchCriteria.status": "active",
+                "$top": _PAGE_SIZE,
+                "$skip": len(items),
+            }
+            page = self._request("GET", url, params=params).json().get("value", [])
+            items.extend(page)
+            if len(page) < _PAGE_SIZE:
+                break
+        prs: list[PullRequest] = []
+        for d in items:
+            number = d["pullRequestId"]
+            if "lastMergeSourceCommit" in d and "lastMergeTargetCommit" in d:
+                prs.append(_to_pull_request(d, number, _web_url(c, number)))
+            else:
+                # Listing omits merge commits until a merge was computed; the detail call waits for it.
+                prs.append(AzureDevOpsAdapter(self, number).get_pull_request())
+        return sorted(prs, key=lambda pr: pr.number)
+
+    def pull_request(self, number: int) -> "AzureDevOpsAdapter":
+        return AzureDevOpsAdapter(self, number)
+
+
+class AzureDevOpsAdapter:
+    platform = Platform.AZURE
+
+    def __init__(self, repository: AzureRepository, number: int) -> None:
+        self._repository = repository
+        self._coords = repository.coords
+        self._number = number
+
+    @property
+    def _project(self) -> str:
+        return quote(self._coords.project)
+
+    @property
+    def _prefix(self) -> str:
+        c = self._coords
+        return (
+            f"{c.base_url}/{self._project}/_apis/git/repositories/"
+            f"{quote(c.repository)}/pullRequests/{self._number}"
+        )
+
+    @property
+    def _web_url(self) -> str:
+        return _web_url(self._coords, self._number)
+
+    def _request(
+        self, method: str, url: str, *, versioned: bool = True, **kwargs: Any
+    ) -> httpx.Response:
+        return self._repository._request(method, url, versioned=versioned, **kwargs)
+
     def get_pull_request(self) -> PullRequest:
         d = self._request("GET", self._prefix).json()
-        state = {
-            "active": PrState.OPEN,
-            "completed": PrState.MERGED,
-            "abandoned": PrState.CLOSED,
-        }[d["status"]]
-        return PullRequest(
-            number=self._number,
-            title=d["title"],
-            description=d.get("description") or "",
-            author=d["createdBy"]["displayName"],
-            state=state,
-            is_draft=bool(d.get("isDraft")),
-            source_branch=_strip_heads(d["sourceRefName"]),
-            target_branch=_strip_heads(d["targetRefName"]),
-            head_sha=d["lastMergeSourceCommit"]["commitId"],
-            base_sha=d["lastMergeTargetCommit"]["commitId"],
-            web_url=self._web_url,
-            head_fetch_ref=d["sourceRefName"],
-            base_fetch_ref=d["targetRefName"],
-        )
+        return _to_pull_request(d, self._number, self._web_url)
 
     def get_authenticated_account(self) -> Account:
         url = f"{self._coords.base_url}/_apis/connectionData"
