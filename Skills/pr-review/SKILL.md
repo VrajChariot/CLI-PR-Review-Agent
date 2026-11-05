@@ -20,7 +20,7 @@ Provide a high-signal code review for a given pull request. Prefer silence over 
   - `pr_diff` — unified diff of the PR (optional `path` argument for one file).
   - `pr_comments` — every existing comment (author, body, file, line).
   - `pr_file_link` — exact permalink for a file line range at the PR head commit.
-  - `pr_post_summary_comment`, `pr_post_inline_comment` — only present when `--comment` was given.
+  - `pr_post_summary_comment`, `pr_post_inline_comment` — only present when `--comment` was given (the summary tool may be withheld when summaries are disabled).
 - Read access to the repository checkout. The working directory is a checkout of the PR head commit.
 - Sub-agent support is optional. If the agent runtime can run parallel sub-agents, use them where noted. Otherwise run the same passes sequentially yourself. Wherever a model tier is mentioned, use the cheapest model for mechanical checks and the strongest available model for bug and logic analysis. Sub-agents cannot call `pr_*` tools: give each one the diff hunks, paths, and PR metadata it needs in its task.
 
@@ -109,7 +109,7 @@ If `--comment` was NOT provided, stop here. Do not post anything to the pull req
 
 ### 8. Post to the pull request (only with `--comment`)
 
-If no new issues were found: if `pr_comments` already contains a comment with the marker `<!-- agent-code-review -->`, post nothing and stop. Otherwise post one summary comment and stop: call `pr_post_summary_comment` with body:
+If no new issues were found: if `pr_post_summary_comment` is not available, or `pr_comments` already contains a comment with the marker `<!-- agent-code-review -->`, post nothing and stop. Otherwise post one summary comment and stop: call `pr_post_summary_comment` with body:
 
 ```
 ### Code review

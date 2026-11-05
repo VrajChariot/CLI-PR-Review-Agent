@@ -52,9 +52,11 @@ class FakeWorkspace:
 PR = PullRequest(1, "t", "", "a", PrState.OPEN, False, "f", "main", "h", "b", "u", "rh", "rb")
 
 
-def tools_for(post: bool):
+def tools_for(post: bool, summary: bool = True):
     platform = FakePlatform()
-    tools = {t.name: t for t in build_host_tools(ReviewJob(PR, platform, FakeWorkspace(), post))}
+    platform.posted = []
+    job = ReviewJob(PR, platform, FakeWorkspace(), post, summary)
+    tools = {t.name: t for t in build_host_tools(job, platform.posted)}
     return platform, tools
 
 
@@ -112,3 +114,18 @@ def test_empty_diff_messages():
     _, tools = tools_for(False)
     assert call(tools, "pr_diff") == "Empty diff."
     assert call(tools, "pr_diff", path="a.py") == "No changes for a.py."
+
+
+def test_summary_tool_withheld_when_summary_disabled():
+    _, tools = tools_for(True, summary=False)
+    assert "pr_post_summary_comment" not in tools
+    assert "pr_post_inline_comment" in tools
+
+
+def test_posted_urls_collect_real_posts_only():
+    platform, tools = tools_for(True)
+    call(tools, "pr_post_inline_comment", path="a.py", line=3, body="x")
+    call(tools, "pr_post_inline_comment", path="a.py", line=3, body="x")
+    call(tools, "pr_post_summary_comment", body="s")
+    call(tools, "pr_post_summary_comment", body="s2")
+    assert platform.posted == ["url-inline", "url-summary"]

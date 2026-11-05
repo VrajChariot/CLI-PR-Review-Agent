@@ -6,7 +6,7 @@ from typing import Any, TextIO, cast
 from omp_rpc import HostTool, RpcClient, RpcError, host_tool
 
 from ..config import Settings
-from ..domain.models import InlineComment, ensure_marker
+from ..domain.models import InlineComment, ReviewOutcome, ensure_marker
 from ..errors import AgentError
 from ..ports.agent import ReviewJob
 from ..skill import load_skill_text
@@ -20,7 +20,7 @@ def _json(value: Any) -> str:
     return json.dumps(value, indent=2, default=str)
 
 
-def build_host_tools(job: ReviewJob) -> list[HostTool[Any, Any]]:
+def build_host_tools(job: ReviewJob, posted: list[str]) -> list[HostTool[Any, Any]]:
     """Platform tools exposed to the agent. Calls arrive on parallel threads."""
     lock = threading.Lock()
     cache: dict[str, Any] = {}
@@ -69,6 +69,7 @@ def build_host_tools(job: ReviewJob) -> list[HostTool[Any, Any]]:
                 return _DUP_SUMMARY
             url = job.platform.post_summary_comment(ensure_marker(args["body"]))
             summary_posted = True
+            posted.append(url)
         return url
 
     def pr_post_inline_comment(args: dict, ctx: Any) -> str:
@@ -84,6 +85,7 @@ def build_host_tools(job: ReviewJob) -> list[HostTool[Any, Any]]:
                 job.pr, InlineComment(path, line, start_line, ensure_marker(body))
             )
             posted_inline.add(key)
+            posted.append(url)
         return url
 
     def tool(name: str, description: str, parameters: dict[str, Any], execute: Any) -> HostTool:
@@ -139,18 +141,21 @@ def build_host_tools(job: ReviewJob) -> list[HostTool[Any, Any]]:
         ),
     ]
     if job.post_comments:
-        tools += [
-            tool(
-                "pr_post_summary_comment",
-                "Post one PR-level summary comment. The review marker is added automatically.",
-                {
-                    "type": "object",
-                    "properties": {"body": {"type": "string"}},
-                    "required": ["body"],
-                    "additionalProperties": False,
-                },
-                pr_post_summary_comment,
-            ),
+        if job.post_summary:
+            tools.append(
+                tool(
+                    "pr_post_summary_comment",
+                    "Post one PR-level summary comment. The review marker is added automatically.",
+                    {
+                        "type": "object",
+                        "properties": {"body": {"type": "string"}},
+                        "required": ["body"],
+                        "additionalProperties": False,
+                    },
+                    pr_post_summary_comment,
+                )
+            )
+        tools.append(
             tool(
                 "pr_post_inline_comment",
                 "Post an inline review comment on the new side of the diff at the PR head "
@@ -168,13 +173,18 @@ def build_host_tools(job: ReviewJob) -> list[HostTool[Any, Any]]:
                     "additionalProperties": False,
                 },
                 pr_post_inline_comment,
-            ),
-        ]
+            )
+        )
     return tools
 
 
 def _run_context(job: ReviewJob) -> str:
     pr = job.pr
+    summary_line = (
+        ["- Summary comment: disabled — if there are no new issues, post nothing."]
+        if job.post_comments and not job.post_summary
+        else []
+    )
     comment_line = (
         "provided — posting tools are available"
         if job.post_comments
@@ -188,6 +198,7 @@ def _run_context(job: ReviewJob) -> str:
             f"- Working directory: detached checkout of PR head {pr.head_sha} "
             f"(base {pr.base_sha}). Do not modify files; use bash only to run the repository's existing test suite (Step 4, Pass 5).",
             f"- --comment: {comment_line}",
+            *summary_line,
             "- Execute every skill step in order. Step 2 is mandatory even for small PRs: "
             "never report that no issues were found without having read the applicable "
             "instruction files from the checkout.",
@@ -202,8 +213,9 @@ class OmpReviewAgent:
         self._settings = settings
         self._progress = progress
 
-    def review(self, job: ReviewJob) -> str:
+    def review(self, job: ReviewJob) -> ReviewOutcome:
         pr = job.pr
+        posted: list[str] = []
         system_append = load_skill_text() + "\n\n" + _run_context(job)
         client = RpcClient(
             model=self._settings.model,
@@ -212,7 +224,7 @@ class OmpReviewAgent:
             tools=("read", "grep", "glob", "bash", "task", "todo"),
             # bash runs in a child process: keep platform credentials out of it.
             env={"GITHUB_TOKEN": "", "GH_TOKEN": "", "AZURE_DEVOPS_PAT": ""},
-            custom_tools=build_host_tools(job),
+            custom_tools=build_host_tools(job, posted),
             append_system_prompt=system_append,
             no_session=True,
             no_skills=True,
@@ -238,6 +250,7 @@ class OmpReviewAgent:
         if result is not None and result.status == "aborted":
             raise AgentError("agent run was aborted")
         try:
-            return turn.require_assistant_text().strip()
+            report = turn.require_assistant_text().strip()
         except RpcError as exc:
             raise AgentError("agent finished without a report") from exc
+        return ReviewOutcome(report, tuple(posted), pr.head_sha)

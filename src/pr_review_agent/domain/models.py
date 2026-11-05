@@ -70,3 +70,10 @@ def ensure_marker(body: str) -> str:
     if REVIEW_MARKER in body:
         return body
     return body.rstrip() + "\n\n" + REVIEW_MARKER
+
+
+@dataclass(frozen=True, slots=True)
+class ReviewOutcome:
+    report: str
+    posted_urls: tuple[str, ...]
+    reviewed_head_sha: str | None  # None = skipped by the eligibility gate
